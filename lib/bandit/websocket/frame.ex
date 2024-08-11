@@ -21,6 +21,46 @@ defmodule Bandit.WebSocket.Frame do
           | Frame.Ping.t()
           | Frame.Pong.t()
 
+  @spec header_length(binary(), non_neg_integer()) ::
+          {:ok, header_length :: integer(), required_length :: integer()}
+          | {:error, :max_frame_size_exceeded}
+          | :more
+  def header_length(
+        <<_fin::1, _compressed::1, _rsv::2, _opcode::4, 1::1, 127::7, length::64, _mask::32,
+          _rest::binary>>,
+        max_frame_size
+      )
+      when max_frame_size == 0 or length <= max_frame_size do
+    {:ok, {14, length}}
+  end
+
+  def header_length(
+        <<_fin::1, _compressed::1, _rsv::2, _opcode::4, 1::1, 126::7, length::16, _mask::32,
+          _rest::binary>>,
+        max_frame_size
+      )
+      when max_frame_size == 0 or length <= max_frame_size do
+    {:ok, {8, length}}
+  end
+
+  def header_length(
+        <<_fin::1, _compressed::1, _rsv::2, _opcode::4, 1::1, length::7, _mask::32,
+          _rest::binary>>,
+        max_frame_size
+      )
+      when length <= 125 and (max_frame_size == 0 or length <= max_frame_size) do
+    {:ok, {6, length}}
+  end
+
+  def header_length(msg, max_frame_size)
+      when max_frame_size != 0 and byte_size(msg) > max_frame_size do
+    {:error, :max_frame_size_exceeded}
+  end
+
+  def header_length(_msg, _max_frame_size) do
+    :more
+  end
+
   @spec deserialize(binary(), non_neg_integer()) ::
           {{:ok, frame()}, iodata()}
           | {{:more, binary()}, <<>>}

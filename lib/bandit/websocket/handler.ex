@@ -19,7 +19,9 @@ defmodule Bandit.WebSocket.Handler do
     state =
       state
       |> Map.take([:handler_module])
-      |> Map.put(:buffer, <<>>)
+      |> Map.put(:header, <<>>)
+      |> Map.put(:payload, {[], 0, 0})
+      |> Map.put(:mode, :header_parsing)
 
     case Connection.init(websock, websock_opts, connection_opts, socket) do
       {:continue, connection} ->
@@ -35,29 +37,70 @@ defmodule Bandit.WebSocket.Handler do
 
   @impl ThousandIsland.Handler
   def handle_data(data, socket, state) do
-    (state.buffer <> data)
-    |> Stream.unfold(
-      &Frame.deserialize(&1, Keyword.get(state.connection.opts, :max_frame_size, 0))
-    )
-    |> Enum.reduce_while({:continue, state}, fn
-      {:ok, frame}, {:continue, state} ->
+    try_parse_frame(data, socket, state)
+  end
+
+  defp try_parse_frame(data, socket, %{mode: :header_parsing} = state) do
+    state = %{state | header: state.header <> data}
+    max_frame_size = Keyword.get(state.connection.opts, :max_frame_size, 0)
+
+    case Frame.header_length(state.header, max_frame_size) do
+      {:ok, {header_length, required_length}} ->
+        payload_length = byte_size(state.header) - header_length
+
+        header = binary_part(state.header, 0, header_length)
+        payload = binary_part(state.header, header_length, payload_length)
+
+        try_parse_frame(<<>>, socket, %{
+          state
+          | header: header,
+            payload: {payload, payload_length, required_length},
+            mode: :payload_parsing
+        })
+
+      {:error, message} ->
+        {:error, {:deserializing, message}, state}
+
+      :more ->
+        {:continue, %{state | header: state.header}}
+    end
+  end
+
+  defp try_parse_frame(data, socket, %{mode: :payload_parsing} = state) do
+    {payload, payload_length, required_length} = state.payload
+
+    payload = [payload | data]
+    payload_length = payload_length + byte_size(data)
+
+    if payload_length >= required_length do
+      payload = IO.iodata_to_binary(payload)
+      header_and_payload = state.header <> binary_part(payload, 0, required_length)
+      next_header = binary_part(payload, required_length, byte_size(payload) - required_length)
+
+      state = %{state | header: next_header, payload: {[], 0, 0}, mode: :header_parsing}
+
+      parse_frame(header_and_payload, socket, state)
+    else
+      {:continue, %{state | payload: {payload, payload_length, required_length}}}
+    end
+  end
+
+  defp parse_frame(header_and_payload, socket, state) do
+    max_frame_size = Keyword.get(state.connection.opts, :max_frame_size, 0)
+
+    case Frame.deserialize(header_and_payload, max_frame_size) do
+      {{:ok, frame}, <<>>} ->
         case Connection.handle_frame(frame, socket, state.connection) do
           {:continue, connection} ->
-            {:cont, {:continue, %{state | connection: connection, buffer: <<>>}}}
+            try_parse_frame(<<>>, socket, %{state | connection: connection})
 
           {:close, connection} ->
-            {:halt, {:close, %{state | connection: connection, buffer: <<>>}}}
+            {:close, %{state | connection: connection}}
 
           {:error, reason, connection} ->
-            {:halt, {:error, reason, %{state | connection: connection, buffer: <<>>}}}
+            {:error, reason, %{state | connection: connection}}
         end
-
-      {:more, rest}, {:continue, state} ->
-        {:halt, {:continue, %{state | buffer: rest}}}
-
-      {:error, message}, {:continue, state} ->
-        {:halt, {:error, {:deserializing, message}, state}}
-    end)
+    end
   end
 
   @impl ThousandIsland.Handler
